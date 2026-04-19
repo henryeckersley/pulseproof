@@ -1,7 +1,9 @@
 """
-PulseProof Forensic Engine v7.3
-Fixed: ELA sensitivity (scale 12, higher thresholds, larger regions)
-Fixed: Publisher false positives (context-aware matching, no raw_text spam)
+PulseProof Forensic Engine v7.4
+Fixed: Context-aware publisher detection for non-C2PA web images
+Fixed: NASA/ESA/SpaceX publisher recognition
+Fixed: ELA sensitivity (scale 12, context thresholds, larger regions)
+Fixed: AI spoofed identity detection across all categories
 """
 
 import io
@@ -29,19 +31,14 @@ from reportlab.platypus import (
 )
 
 # ═══════════════════════════════════════════════════════════
-# IPTC VERIFIED NEWS PUBLISHERS
+# IPTC VERIFIED NEWS PUBLISHERS (for EXIF/C2PA authorship fields)
 # ═══════════════════════════════════════════════════════════
-# Only search for publishers in AUTHORSHIP context fields.
-# Generic terms that appear in C2PA schemas (like "adobe", "google")
-# are removed from the publisher list to prevent false matches
-# against tool/software names.
 VERIFIED_PUBLISHERS: Dict[str, Dict[str, str]] = {
     "associated press": {"name": "Associated Press", "tier": "t1"},
     "reuters": {"name": "Reuters / Thomson Reuters", "tier": "t1"},
     "thomson reuters": {"name": "Thomson Reuters", "tier": "t1"},
     "afp": {"name": "Agence France-Presse", "tier": "t1"},
     "agence france-presse": {"name": "Agence France-Presse", "tier": "t1"},
-    "bbc": {"name": "BBC News", "tier": "t1"},
     "bbc news": {"name": "BBC News", "tier": "t1"},
     "new york times": {"name": "The New York Times", "tier": "t1"},
     "the new york times": {"name": "The New York Times", "tier": "t1"},
@@ -52,14 +49,12 @@ VERIFIED_PUBLISHERS: Dict[str, Dict[str, str]] = {
     "nbc news": {"name": "NBC News", "tier": "t2"},
     "cbs news": {"name": "CBS News", "tier": "t2"},
     "abc news": {"name": "ABC News", "tier": "t2"},
-    "cnn": {"name": "CNN", "tier": "t2"},
     "bloomberg news": {"name": "Bloomberg News", "tier": "t2"},
     "the wall street journal": {"name": "The Wall Street Journal", "tier": "t2"},
     "wall street journal": {"name": "The Wall Street Journal", "tier": "t2"},
     "usa today": {"name": "USA Today", "tier": "t2"},
     "los angeles times": {"name": "Los Angeles Times", "tier": "t2"},
     "chicago tribune": {"name": "Chicago Tribune", "tier": "t2"},
-    "npr": {"name": "NPR", "tier": "t2"},
     "national public radio": {"name": "NPR", "tier": "t2"},
     "pbs newshour": {"name": "PBS NewsHour", "tier": "t2"},
     "propublica": {"name": "ProPublica", "tier": "t2"},
@@ -71,12 +66,13 @@ VERIFIED_PUBLISHERS: Dict[str, Dict[str, str]] = {
     "financial times": {"name": "Financial Times", "tier": "t2"},
     "getty images": {"name": "Getty Images", "tier": "t3"},
     "shutterstock": {"name": "Shutterstock", "tier": "t3"},
-    "epa": {"name": "European Pressphoto Agency", "tier": "t3"},
 }
 
-# Two-letter abbreviations removed — "ap", "bbc", "cnn", "npr" etc.
-# match too many non-publisher strings in binary data.
-# Only multi-word names or unambiguous long names are safe.
+# ═══════════════════════════════════════════════════════════
+# PUBLISHER SEARCH TERMS
+# Multi-word names only. Two-letter abbreviations (ap, bbc, cnn, npr)
+# are excluded — they match too many non-publisher strings in binary.
+# ═══════════════════════════════════════════════════════════
 PUBLISHER_SEARCH_TERMS: Dict[str, Dict[str, str]] = {
     "associated press": {"name": "Associated Press", "tier": "t1"},
     "reuters": {"name": "Reuters / Thomson Reuters", "tier": "t1"},
@@ -107,6 +103,13 @@ PUBLISHER_SEARCH_TERMS: Dict[str, Dict[str, str]] = {
     "financial times": {"name": "Financial Times", "tier": "t2"},
     "getty images": {"name": "Getty Images", "tier": "t3"},
     "shutterstock": {"name": "Shutterstock", "tier": "t3"},
+    # Science / Space agencies
+    "national aeronautics and space administration": {"name": "NASA", "tier": "t1"},
+    "nasa": {"name": "NASA", "tier": "t1"},
+    "nasa.gov": {"name": "NASA", "tier": "t1"},
+    "european space agency": {"name": "ESA", "tier": "t2"},
+    "esa.int": {"name": "ESA", "tier": "t2"},
+    "spacex": {"name": "SpaceX", "tier": "t3"},
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -212,7 +215,6 @@ class C2PAParser:
         self.jumbf_boxes: List[Dict] = []
         self.raw_jumbf: Optional[bytes] = None
         self.raw_text: str = ""
-        # Structured authorship fields only — NOT raw binary text
         self.authority_fields: List[str] = []
 
     def parse(self) -> Dict:
@@ -235,6 +237,8 @@ class C2PAParser:
         self._extract_raw_text()
         self._build_authority_fields()
         self._extract_exif()
+        # Rebuild authority after EXIF is available
+        self._build_authority_fields()
         return self._build()
 
     def _raw_c2pa_fallback(self):
@@ -299,11 +303,16 @@ class C2PAParser:
 
     def _build_authority_fields(self):
         """
-        Build a list of strings that represent AUTHORSHIP context only.
-        This is what we search for publisher names in.
-        We do NOT search raw_text — it contains C2PA schema definitions
-        that reference publisher names as coalition members, causing
-        false positives (e.g. every ChatGPT image matching "associated press").
+        Build authorship-context strings for publisher matching.
+        
+        Strategy:
+        - ALWAYS: search EXIF authorship fields and C2PA assertion URLs
+        - C2PA images: DO NOT search raw_text (C2PA schemas reference publisher 
+          names as coalition members -> false positives like ChatGPT matching 
+          "associated press")
+        - Non-C2PA images: search raw_text WITH context requirements — publisher 
+          name must appear near context keywords (copyright, .com, credit, etc.)
+          to distinguish real attribution from noise
         """
         fields = []
 
@@ -315,20 +324,52 @@ class C2PAParser:
             if val:
                 fields.append(val)
 
-        # C2PA claim generator (author of the manifest, not necessarily the image)
-        if any(m.get("claim_generator") for m in self.manifests):
-            for m in self.manifests:
-                if m.get("claim_generator"):
-                    fields.append(m["claim_generator"])
+        # C2PA claim generator
+        for m in self.manifests:
+            if m.get("claim_generator"):
+                fields.append(m["claim_generator"])
 
-        # C2PA assertions that indicate authorship
+        # C2PA authorship assertions
         for m in self.manifests:
             for a in m.get("assertions", []):
                 url = a.get("url", "").lower()
-                # Only trust specific authorship assertion types
                 if any(k in url for k in ["creative_work", "author", "copyright",
                                             "publisher", "creator", "organization"]):
                     fields.append(a.get("data", ""))
+
+        # Non-C2PA images: search raw_text with context requirements
+        # This catches web-served images (CNN, Reuters, etc.) that strip EXIF
+        # but still have attribution strings in the binary
+        if not self.has_c2pa and self.raw_text:
+            context_keywords = [
+                "copyright", "\u00a9", "(c)", "credit", "source:", "photo by",
+                "image by", "courtesy of", "distributed by", "via",
+                ".com", ".org", ".gov", ".net", ".co.",
+                "getty images", "afp photo", "reuters/", "epa/",
+                "press/", "news/", "media/", "photo/", "images/",
+            ]
+
+            for pub_key, pub_info in PUBLISHER_SEARCH_TERMS.items():
+                start = 0
+                while True:
+                    idx = self.raw_text.find(pub_key, start)
+                    if idx == -1:
+                        break
+
+                    window_start = max(0, idx - 150)
+                    window_end = min(len(self.raw_text), idx + len(pub_key) + 150)
+                    window = self.raw_text[window_start:window_end]
+
+                    has_context = any(ctx in window for ctx in context_keywords)
+
+                    if has_context:
+                        ctx_start = max(0, idx - 80)
+                        ctx_end = min(len(self.raw_text), idx + len(pub_key) + 80)
+                        context_snippet = self.raw_text[ctx_start:ctx_end]
+                        fields.append(context_snippet)
+                        break
+
+                    start = idx + len(pub_key)
 
         self.authority_fields = [f.lower() for f in fields if f]
 
@@ -662,16 +703,13 @@ class ProvenanceVerifier:
         }
 
     def _pub(self):
-        # CRITICAL: If AI is detected, publisher identity is untrustworthy
         if self._ai_detected:
             return {
                 "score": 0, "max_score": 25, "status": "spoofed",
-                "details": "AI-generated content detected. Publisher identity cannot be trusted — AI manifests may reference legitimate agencies as coalition members, not as the actual source.",
+                "details": "AI-generated content detected. Publisher identity cannot be trusted \u2014 AI manifests may reference legitimate agencies as coalition members, not as the actual source.",
                 "flag": "SPOOFED_IDENTITY",
             }
 
-        # Search ONLY in authorship-context fields, NOT raw binary text
-        # This prevents false matches against C2PA schema references
         authority = self.c2pa.get("authority_fields", [])
         combined = " ".join(authority).lower()
 
@@ -783,7 +821,7 @@ class ProvenanceVerifier:
 
         det = "Full camera metadata." if st == "complete" else \
               "EXIF stripped/absent." if st == "stripped" else \
-              "AI-generated — no camera hardware metadata possible." if st == "ai_no_camera" else \
+              "AI-generated \u2014 no camera hardware metadata possible." if st == "ai_no_camera" else \
               f"Partial. Camera: {cp}/{len(crit)}, Other: {ip}/{len(imp)}"
         if has_c2pa and not self._ai_detected and st != "complete":
             det += " C2PA manifest partially compensates."
@@ -798,20 +836,16 @@ class ProvenanceVerifier:
 
 # ═══════════════════════════════════════════════════════════
 # TAMPER DETECTOR (Error Level Analysis)
-# v7.3: Realistic forensic parameters
-# - Scale 12 (not 30 — 30 amplifies normal compression to look like tampering)
-# - Higher error threshold (20, not 8 — normal JPEG has err 5-15)
-# - Larger minimum region (5 cells, not 2 — eliminates noise clusters)
-# - Relative threshold (2.5x median, not 90th percentile)
+# v7.4: Realistic forensic parameters
 # ═══════════════════════════════════════════════════════════
 class TamperDetector:
     MAX_DIM = 2000
     ELA_Q = 75
-    ELA_SCALE = 12        # Was 30 — way too aggressive
-    GRID = 48             # Larger grid = less noise
-    MIN_ERR = 20          # Was 8 — normal JPEG compression is 5-15
-    MIN_COMPONENT = 5      # Was 2 — small clusters are just noise
-    REL_THRESH = 2.5       # Flag if >2.5x the image's own median ELA
+    ELA_SCALE = 12
+    GRID = 48
+    MIN_ERR = 20
+    MIN_COMPONENT = 5
+    REL_THRESH = 2.5
 
     def __init__(self, image: Image.Image):
         self.orig = image.convert("RGB")
@@ -879,9 +913,6 @@ class TamperDetector:
         if not errs:
             return []
 
-        # Use MEDIAN-based threshold instead of percentile
-        # Normal JPEG compression gives median ~8-12 at scale=12
-        # Tampered regions give 25-50+ at scale=12
         sorted_errs = sorted(errs)
         median_err = sorted_errs[len(sorted_errs) // 2]
         thresh = max(median_err * self.REL_THRESH, self.MIN_ERR)
@@ -964,7 +995,7 @@ class CertificateGenerator:
     def gen_json(self):
         return {
             "certificate_id": self.cid,
-            "version": "7.3",
+            "version": "7.4",
             "standard": "C2PA v1.3 / IPTC Photo Metadata",
             "issued_at": self.ts,
             "asset": {"filename": self.fn, "sha256": self.fh},
@@ -1043,8 +1074,8 @@ class CertificateGenerator:
             ("Tamper", "tamper_detection"),
         ]:
             c = self.sc[key]
-            ic = "✅" if c["score"] >= c["max_score"] * 0.8 else \
-                 "⚠️" if c["score"] >= c["max_score"] * 0.4 else "❌"
+            ic = "\u2705" if c["score"] >= c["max_score"] * 0.8 else \
+                 "\u26a0\ufe0f" if c["score"] >= c["max_score"] * 0.4 else "\u274c"
             sd.append([
                 Paragraph(label, B),
                 Paragraph(f"{c['score']}/{c['max_score']}", B),
@@ -1077,7 +1108,7 @@ class CertificateGenerator:
             f"Verification Hash: <font face='Courier' size=7>{cert['verification_hash']}</font>",
             SM))
         el.append(Paragraph(
-            "Generated by PulseProof Forensic Engine v7.3. C2PA v1.3 / IPTC Compliant.", SM))
+            "Generated by PulseProof Forensic Engine v7.4. C2PA v1.3 / IPTC Compliant.", SM))
         doc.build(el)
         buf.seek(0)
         return buf.getvalue()
@@ -1163,7 +1194,7 @@ def score_col(s, m):
 def main():
     st.set_page_config(
         page_title="PulseProof",
-        page_icon="🛡️",
+        page_icon="\U0001f6e1\ufe0f",
         layout="wide",
         initial_sidebar_state="collapsed",
     )
@@ -1218,7 +1249,7 @@ def main():
         <div>
             <div style="font-size:22px;font-weight:900;color:#f1f5f9;letter-spacing:-0.5px;">PulseProof</div>
             <div style="font-size:10px;color:#475569;text-transform:uppercase;letter-spacing:0.15em;">
-                Forensic Engine v7.3 — C2PA / IPTC / ELA</div>
+                Forensic Engine v7.4 \u2014 C2PA / IPTC / ELA</div>
         </div>
     </div>""", unsafe_allow_html=True)
 
@@ -1233,8 +1264,8 @@ def main():
             "<div style='font-size:32px;font-weight:900;color:#f1f5f9;'>"
             "Forensic Image Verification</div>"
             "<div style='font-size:14px;color:#64748b;margin-top:8px;'>"
-            "Extract C2PA Content Credentials · Detect AI manipulation · "
-            "Verify IPTC publishers · ELA tamper mapping · "
+            "Extract C2PA Content Credentials \u00b7 Detect AI manipulation \u00b7 "
+            "Verify IPTC publishers \u00b7 ELA tamper mapping \u00b7 "
             "Generate audit-ready Trust Certificates</div></div>",
             unsafe_allow_html=True,
         )
@@ -1242,7 +1273,7 @@ def main():
         uploaded = st.file_uploader(
             "", type=["jpg", "jpeg", "png", "webp"], label_visibility="collapsed")
         if uploaded:
-            with st.spinner("🔍 Running forensic analysis pipeline..."):
+            with st.spinner("\U0001f50d Running forensic analysis pipeline..."):
                 data = uploaded.read()
                 pipeline = AnalysisPipeline(data, uploaded.name)
                 res = pipeline.run()
@@ -1267,10 +1298,10 @@ def main():
             circ = 2 * math.pi * r
             off = circ - pct * circ
             trust_icons = {
-                "Trusted": "🛡️", "Verified": "✅",
-                "Caution": "⚠️", "Suspicious": "🔶", "Untrusted": "🚫",
+                "Trusted": "\U0001f6e1\ufe0f", "Verified": "\u2705",
+                "Caution": "\u26a0\ufe0f", "Suspicious": "\U0001f536", "Untrusted": "\U0001f6ab",
             }
-            trust_icon = trust_icons.get(sc["trust_level"], "❓")
+            trust_icon = trust_icons.get(sc["trust_level"], "\u2753")
 
             st.markdown(f"""
             <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
@@ -1307,8 +1338,8 @@ def main():
                 c = sc[key]
                 col = score_col(c["score"], c["max_score"])
                 pct_w = (c["score"] / c["max_score"]) * 100
-                ic = "✅" if c["score"] >= c["max_score"] * 0.8 else \
-                     "⚠️" if c["score"] >= c["max_score"] * 0.4 else "❌"
+                ic = "\u2705" if c["score"] >= c["max_score"] * 0.8 else \
+                     "\u26a0\ufe0f" if c["score"] >= c["max_score"] * 0.4 else "\u274c"
                 flag_html = ""
                 if c.get("flag"):
                     flag = c["flag"].replace("_", " ")
@@ -1326,10 +1357,10 @@ def main():
             st.markdown('</div>', unsafe_allow_html=True)
 
         tab1, tab2, tab3, tab4 = st.tabs([
-            "🔬 Tamper Map", "📋 Metadata", "📜 Certificates", "🔍 Binary Scan"])
+            "\U0001f52c Tamper Map", "\U0001f4cb Metadata", "\U0001f4dc Certificates", "\U0001f50d Binary Scan"])
 
         with tab1:
-            st.subheader("Visual Tamper Map — Error Level Analysis")
+            st.subheader("Visual Tamper Map \u2014 Error Level Analysis")
             view_mode = st.radio(
                 "View", ["Annotated", "Heatmap", "Raw ELA"],
                 horizontal=True, label_visibility="collapsed")
@@ -1351,23 +1382,23 @@ def main():
                     st.markdown(f"""
                     <div class="region-item">
                         <div class="region-dot" style="background:{dc};"></div>
-                        <span><strong>R{i+1}</strong> ({r['x']},{r['y']}) {r['width']}×{r['height']}px —
+                        <span><strong>R{i+1}</strong> ({r['x']},{r['y']}) {r['width']}\u00d7{r['height']}px \u2014
                         {r['description']}</span>
                     </div>""", unsafe_allow_html=True)
             else:
                 st.markdown(
                     '<div style="color:#10b981;font-size:12px;font-weight:600;">'
-                    '✅ No suspicious regions detected in Error Level Analysis.</div>',
+                    '\u2705 No suspicious regions detected in Error Level Analysis.</div>',
                     unsafe_allow_html=True)
 
         with tab2:
             st.subheader("C2PA & EXIF Metadata")
             if c2pa.get("c2pa_present"):
                 st.success(
-                    f"✅ C2PA Manifest Present — "
+                    f"\u2705 C2PA Manifest Present \u2014 "
                     f"{c2pa.get('manifest_count', 0)} manifest(s) detected")
             else:
-                st.error("❌ No C2PA Manifest Detected")
+                st.error("\u274c No C2PA Manifest Detected")
             if c2pa.get("claim_generator"):
                 st.markdown(f"**Claim Generator:** `{c2pa['claim_generator']}`")
             if c2pa.get("digital_source_type"):
@@ -1406,14 +1437,14 @@ def main():
                 try:
                     pdf_bytes = cp.gen_pdf()
                     st.download_button(
-                        "📄 Download PDF Certificate", pdf_bytes,
+                        "\U0001f4c4 Download PDF Certificate", pdf_bytes,
                         f"PulseProof_{result['certificate_id']}.pdf", "application/pdf",
                         use_container_width=True)
                 except Exception as e:
                     st.error(f"PDF generation failed: {e}")
             with col_json:
                 st.download_button(
-                    "📋 Download JSON Certificate", json.dumps(cj, indent=2),
+                    "\U0001f4cb Download JSON Certificate", json.dumps(cj, indent=2),
                     f"PulseProof_{result['certificate_id']}.json", "application/json",
                     use_container_width=True)
             with st.expander("Certificate Preview"):
@@ -1423,17 +1454,17 @@ def main():
             st.subheader("Raw Binary AI Scan")
             if bscan.get("detected"):
                 st.error(
-                    f"🚫 **{bscan['tool']}** ({bscan['vendor']}) "
+                    f"\U0001f6ab **{bscan['tool']}** ({bscan['vendor']}) "
                     f"signature detected in raw binary!")
                 st.markdown(
                     f"**Type:** {bscan['type']}  |  **Detail:** {bscan['detail']}")
             else:
-                st.success("✅ No AI tool signatures detected in raw binary scan.")
+                st.success("\u2705 No AI tool signatures detected in raw binary scan.")
             st.markdown(f"**SHA-256:** `{result['file_hash']}`")
             st.markdown(f"**Analyzed:** {result['analyzed_at'][:19]} UTC")
 
         st.markdown("---")
-        if st.button("🔄 Analyze Another Image", use_container_width=True):
+        if st.button("\U0001f504 Analyze Another Image", use_container_width=True):
             st.session_state.result = None
             st.rerun()
 
