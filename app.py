@@ -785,10 +785,10 @@ class ProvenanceVerifier:
                     "details": f"AI in EXIF: {ti['label']}", "flag": "AI_EXIF",
                 }
         return {
-            "score": 18, "max_score": 25, "status": "likely_human",
-            "details": "No AI indicators found in C2PA, EXIF, or action history.",
+            "score": 22, "max_score": 25, "status": "likely_human",
+            "details": "No AI indicators found. Strong confidence image is human-originated.",
             "flag": None,
-        }
+                }
 
     def _meta(self):
         exif = self.c2pa.get("exif", {})
