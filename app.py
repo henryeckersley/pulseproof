@@ -836,6 +836,8 @@ def main():
             r = 88
             circ = 2 * math.pi * r
             off = circ - pct * circ
+                        trust_icon = {"Trusted":"🛡️","Verified":"✅","Caution":"⚠️","Suspicious":"🔶","Untrusted":"🚫"}.get(sc["trust_level"], "❓")
+
             st.markdown(f"""
             <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
                         padding:30px;background:#1e293b;border-radius:16px;border:1px solid #334155;">
@@ -851,7 +853,7 @@ def main():
                 </div>
                 <div class="trust-badge" style="border:2px solid {col_val};
                      background:{col_val}15;color:{col_val};">
-                    {{"Trusted":"🛡️","Verified":"✅","Caution":"⚠️","Suspicious":"🔶","Untrusted":"🚫"}.get(sc["trust_level"],"❓")}
+                    {trust_icon}
                     &nbsp;{sc['trust_level']}
                 </div>
                 <div style="margin-top:12px;font-size:10px;color:#475569;font-family:monospace;">
