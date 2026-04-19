@@ -836,7 +836,7 @@ def main():
             r = 88
             circ = 2 * math.pi * r
             off = circ - pct * circ
-                        trust_icon = {"Trusted":"🛡️","Verified":"✅","Caution":"⚠️","Suspicious":"🔶","Untrusted":"🚫"}.get(sc["trust_level"], "❓")
+            trust_icon = {"Trusted":"🛡️","Verified":"✅","Caution":"⚠️","Suspicious":"🔶","Untrusted":"🚫"}.get(sc["trust_level"], "❓")
 
             st.markdown(f"""
             <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
