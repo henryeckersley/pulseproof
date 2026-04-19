@@ -1,7 +1,6 @@
 """
-PulseProof Forensic Engine v7.1
-Complete C2PA Provenance Verification System
-Fixed: WebP/PNG EXIF, raw binary text search, C2PA fallback detection
+PulseProof Forensic Engine v7.2
+Fixed: AI spoofed identity detection, AI C2PA metadata compensation
 """
 
 import io
@@ -53,6 +52,7 @@ VERIFIED_PUBLISHERS: Dict[str, Dict[str, str]] = {
     "bloomberg": {"name": "Bloomberg", "tier": "t2"},
     "bloomberg news": {"name": "Bloomberg News", "tier": "t2"},
     "the wall street journal": {"name": "The Wall Street Journal", "tier": "t2"},
+    "wall street journal": {"name": "The Wall Street Journal", "tier": "t2"},
     "usa today": {"name": "USA Today", "tier": "t2"},
     "los angeles times": {"name": "Los Angeles Times", "tier": "t2"},
     "chicago tribune": {"name": "Chicago Tribune", "tier": "t2"},
@@ -144,7 +144,7 @@ HUMAN_SOURCE_TYPES = {
 
 
 # ═══════════════════════════════════════════════════════════
-# JUMBF BINARY PARSER (ISO 19566-5:2023)
+# JUMBF BINARY PARSER
 # ═══════════════════════════════════════════════════════════
 class JUMBFParser:
     def __init__(self, data: bytes):
@@ -218,46 +218,34 @@ class C2PAParser:
             self._extract_manifests(self.jumbf_boxes)
             self.has_c2pa = len(self.manifests) > 0
 
-        # FALLBACK: raw binary C2PA detection
         if not self.has_c2pa:
             self._raw_c2pa_fallback()
 
-        # Extract readable text from binary for publisher/AI matching
         self._extract_raw_text()
-
         self._extract_exif()
         return self._build()
 
     def _raw_c2pa_fallback(self):
-        """Fallback: search raw binary for C2PA markers when structured parsing fails"""
         data = self.file_data
         dl = data.lower()
-
         if b"jumb" in data or b"JUMF" in data:
             self.has_c2pa = True
-
         for marker in [b"c2pa", b"C2PA", b"content credentials",
                        b"Content Credentials", b"content-authenticity",
                        b"Content Authenticity"]:
             if marker in data or marker in dl:
                 self.has_c2pa = True
                 break
-
         if self.has_c2pa and not self.manifests:
-            # Try to find claim generator in raw data
             for tool_key, tool_info in AI_TOOL_SIGNATURES.items():
                 if tool_key.encode() in dl:
                     self.manifests.append({
                         "claim_generator": tool_key,
-                        "instance_id": "",
-                        "assertions": [],
+                        "instance_id": "", "assertions": [],
                         "digital_source_type": None,
-                        "actions": [],
-                        "signer_info": None,
+                        "actions": [], "signer_info": None,
                     })
                     break
-
-            # Try CBOR decode near C2PA markers
             c2pa_idx = dl.find(b"c2pa")
             if c2pa_idx >= 0:
                 for offset in range(max(0, c2pa_idx - 300),
@@ -284,7 +272,6 @@ class C2PAParser:
                         continue
 
     def _extract_raw_text(self):
-        """Extract readable ASCII/UTF-8 strings from binary for publisher/AI matching"""
         strings = []
         current = []
         for byte in self.file_data:
@@ -469,8 +456,6 @@ class C2PAParser:
 
     def _extract_exif(self):
         result = {}
-
-        # Method 1: piexif (JPEG/TIFF only)
         try:
             ed = piexif.load(self.file_data)
             for ifd_name in ("0th", "Exif", "GPS", "1st"):
@@ -497,8 +482,6 @@ class C2PAParser:
                     result[tname] = str(val)[:500]
         except Exception:
             pass
-
-        # Method 2: Pillow _getexif() fallback (WebP, some PNG)
         if len(result) < 3:
             try:
                 img = Image.open(io.BytesIO(self.file_data))
@@ -517,8 +500,6 @@ class C2PAParser:
                             result[tname] = str(value)[:500]
             except Exception:
                 pass
-
-        # Method 3: Pillow image.info
         if len(result) < 2:
             try:
                 img = Image.open(io.BytesIO(self.file_data))
@@ -534,7 +515,6 @@ class C2PAParser:
                         result[f"Pillow_{key}"] = str(val)[:500]
             except Exception:
                 pass
-
         self.exif_data = result
 
 
@@ -546,6 +526,40 @@ class ProvenanceVerifier:
         self.c2pa = c2pa
         self.fh = fh
         self.fn = fn
+        # Pre-compute AI detection for cross-category checks
+        self._ai_detected = self._detects_ai()
+
+    def _detects_ai(self) -> bool:
+        """Check if ANY AI indicator exists across all data sources"""
+        # Check claim generator
+        gen = (self.c2pa.get("claim_generator") or "").lower()
+        for tk in AI_TOOL_SIGNATURES:
+            if tk in gen:
+                return True
+        # Check digital source type
+        dst = (self.c2pa.get("digital_source_type") or "").lower()
+        for uri in AI_SOURCE_TYPES:
+            if uri.lower() in dst:
+                return True
+        # Check raw binary text
+        rt = (self.c2pa.get("raw_text") or "").lower()
+        for tk in AI_TOOL_SIGNATURES:
+            if tk in rt:
+                return True
+        # Check actions
+        for action in self.c2pa.get("actions", []):
+            astr = json.dumps(action).lower()
+            for tk in AI_TOOL_SIGNATURES:
+                if tk in astr:
+                    return True
+            if any(k in astr for k in ["generative", "inpaint", "outpaint", "synthetic"]):
+                return True
+        # Check EXIF software
+        sw = (self.c2pa.get("exif", {}).get("Software", "") or "").lower()
+        for tk in AI_TOOL_SIGNATURES:
+            if tk in sw:
+                return True
+        return False
 
     def generate_scorecard(self):
         return {
@@ -594,8 +608,8 @@ class ProvenanceVerifier:
         for tk, ti in AI_TOOL_SIGNATURES.items():
             if tk in gen:
                 return {
-                    "score": 8, "max_score": 25, "status": "ai_signed",
-                    "details": f"C2PA present, signed by AI: {ti['label']} ({ti['vendor']})",
+                    "score": 5, "max_score": 25, "status": "ai_signed",
+                    "details": f"C2PA present but AI-signed: {ti['label']} ({ti['vendor']}). Transparency exists but origin is synthetic.",
                     "flag": "AI_C2PA",
                 }
         sig = self.c2pa.get("signer_info")
@@ -607,6 +621,16 @@ class ProvenanceVerifier:
         }
 
     def _pub(self):
+        # CRITICAL: If AI is detected, publisher identity is untrustworthy
+        # AI tools often include C2PA coalition member names in their manifests
+        # which creates false positives (e.g., ChatGPT listing "Associated Press")
+        if self._ai_detected:
+            return {
+                "score": 0, "max_score": 25, "status": "spoofed",
+                "details": "AI-generated content detected. Publisher identity cannot be trusted — AI manifests may reference legitimate agencies as coalition members, not as the actual source.",
+                "flag": "SPOOFED_IDENTITY",
+            }
+
         exif = self.c2pa.get("exif", {})
         fields = [
             exif.get("Artist", ""), exif.get("Copyright", ""),
@@ -618,7 +642,6 @@ class ProvenanceVerifier:
             fields.append(self.c2pa["claim_generator"])
         if self.c2pa.get("digital_source_type"):
             fields.append(self.c2pa["digital_source_type"])
-        # Search raw binary text (finds publisher names in any format)
         if self.c2pa.get("raw_text"):
             fields.append(self.c2pa["raw_text"])
         combined = " ".join(fields).lower()
@@ -645,7 +668,6 @@ class ProvenanceVerifier:
 
     def _ai(self):
         dst = (self.c2pa.get("digital_source_type") or "").lower()
-        # Check full URIs and simplified names
         for uri, info in AI_SOURCE_TYPES.items():
             if uri.lower() in dst:
                 s = 0 if info["type"] == "ai_generated" else 8
@@ -704,7 +726,6 @@ class ProvenanceVerifier:
         cp = sum(1 for f in crit if exif.get(f))
         ip = sum(1 for f in imp if exif.get(f))
         has_c2pa = self.c2pa.get("c2pa_present", False)
-        has_raw = bool(self.c2pa.get("raw_text"))
         is_webp = self.fn.endswith(".webp")
         is_png = self.fn.endswith(".png")
 
@@ -714,11 +735,15 @@ class ProvenanceVerifier:
             sc, st = 9, "partial"
         elif cp + ip > 0:
             sc, st = 5, "minimal"
-        elif has_c2pa:
+        elif has_c2pa and not self._ai_detected:
+            # Only legitimate (non-AI) C2PA compensates for missing EXIF
             sc, st = 8, "c2pa_compensated"
+        elif has_c2pa and self._ai_detected:
+            # AI C2PA does NOT compensate — AI tools don't have camera hardware
+            sc, st = 1, "ai_no_camera"
         elif (is_webp or is_png) and len(exif) > 0:
             sc, st = 5, "format_limited"
-        elif (is_webp or is_png) and has_raw:
+        elif (is_webp or is_png):
             sc, st = 3, "format_limited"
         elif len(exif) > 0:
             sc, st = 3, "minimal"
@@ -727,8 +752,9 @@ class ProvenanceVerifier:
 
         det = "Full camera metadata." if st == "complete" else \
               "EXIF stripped/absent." if st == "stripped" else \
+              "AI-generated — no camera hardware metadata possible." if st == "ai_no_camera" else \
               f"Partial. Camera: {cp}/{len(crit)}, Other: {ip}/{len(imp)}"
-        if has_c2pa and st != "complete":
+        if has_c2pa and not self._ai_detected and st != "complete":
             det += " C2PA manifest partially compensates."
         if (is_webp or is_png) and st in ("format_limited", "minimal"):
             det += " Format has limited EXIF support."
@@ -740,7 +766,7 @@ class ProvenanceVerifier:
 
 
 # ═══════════════════════════════════════════════════════════
-# TAMPER DETECTOR (Error Level Analysis)
+# TAMPER DETECTOR
 # ═══════════════════════════════════════════════════════════
 class TamperDetector:
     MAX_DIM = 2000
@@ -893,7 +919,7 @@ class CertificateGenerator:
     def gen_json(self):
         return {
             "certificate_id": self.cid,
-            "version": "7.1",
+            "version": "7.2",
             "standard": "C2PA v1.3 / IPTC Photo Metadata",
             "issued_at": self.ts,
             "asset": {"filename": self.fn, "sha256": self.fh},
@@ -1006,7 +1032,7 @@ class CertificateGenerator:
             f"Verification Hash: <font face='Courier' size=7>{cert['verification_hash']}</font>",
             SM))
         el.append(Paragraph(
-            "Generated by PulseProof Forensic Engine v7.1. C2PA v1.3 / IPTC Compliant.", SM))
+            "Generated by PulseProof Forensic Engine v7.2. C2PA v1.3 / IPTC Compliant.", SM))
         doc.build(el)
         buf.seek(0)
         return buf.getvalue()
@@ -1098,7 +1124,6 @@ def main():
         initial_sidebar_state="collapsed",
     )
 
-    # ── CSS ──
     st.markdown("""<style>
     .stApp { background: #0f172a; }
     .score-ring {
@@ -1125,6 +1150,11 @@ def main():
         color: #fca5a5; font-size: 9px; font-weight: 700; border-radius: 3px;
         text-transform: uppercase; letter-spacing: 0.05em; margin-left: 6px;
     }
+    .flag-badge-warn {
+        display: inline-block; padding: 1px 6px; background: rgba(245,158,11,0.15);
+        color: #fcd34d; font-size: 9px; font-weight: 700; border-radius: 3px;
+        text-transform: uppercase; letter-spacing: 0.05em; margin-left: 6px;
+    }
     .trust-badge {
         display: inline-flex; align-items: center; gap: 6px; padding: 6px 16px;
         border-radius: 9999px; font-size: 14px; font-weight: 700; margin-top: 12px;
@@ -1136,7 +1166,6 @@ def main():
     .region-dot { width: 8px; height: 8px; border-radius: 50%; margin-top: 3px; flex-shrink: 0; }
     </style>""", unsafe_allow_html=True)
 
-    # ── Header ──
     st.markdown("""
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;">
         <div style="width:42px;height:42px;background:#4f46e5;border-radius:12px;
@@ -1145,18 +1174,16 @@ def main():
         <div>
             <div style="font-size:22px;font-weight:900;color:#f1f5f9;letter-spacing:-0.5px;">PulseProof</div>
             <div style="font-size:10px;color:#475569;text-transform:uppercase;letter-spacing:0.15em;">
-                Forensic Engine v7.1 — C2PA / IPTC / ELA</div>
+                Forensic Engine v7.2 — C2PA / IPTC / ELA</div>
         </div>
     </div>""", unsafe_allow_html=True)
 
-    # ── State ──
     if "result" not in st.session_state:
         st.session_state.result = None
 
     result = st.session_state.result
 
     if not result:
-        # ── Upload ──
         st.markdown(
             "<div style='text-align:center;margin:40px 0 20px;'>"
             "<div style='font-size:32px;font-weight:900;color:#f1f5f9;'>"
@@ -1187,7 +1214,6 @@ def main():
         tamp = result["tamper_analysis"]
         bscan = result["binary_ai_scan"]
 
-        # ── Top Row ──
         score_col_ui, card_col_ui = st.columns([1, 2.5])
 
         with score_col_ui:
@@ -1241,7 +1267,9 @@ def main():
                      "⚠️" if c["score"] >= c["max_score"] * 0.4 else "❌"
                 flag_html = ""
                 if c.get("flag"):
-                    flag_html = f'<span class="flag-badge">{c["flag"].replace("_", " ")}</span>'
+                    flag = c["flag"].replace("_", " ")
+                    badge_class = "flag-badge" if c["score"] < c["max_score"] * 0.4 else "flag-badge-warn"
+                    flag_html = f'<span class="{badge_class}">{flag}</span>'
                 st.markdown(f"""
                 <div class="cat-bar">
                     <div class="cat-label">
@@ -1253,7 +1281,6 @@ def main():
                 </div>""", unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
-        # ── Tabs ──
         tab1, tab2, tab3, tab4 = st.tabs([
             "🔬 Tamper Map", "📋 Metadata", "📜 Certificates", "🔍 Binary Scan"])
 
@@ -1272,7 +1299,6 @@ def main():
                 st.image(pil, use_container_width=True)
             else:
                 st.info("ELA data not available for this view.")
-
             if tamp.get("regions"):
                 st.markdown("**Detected Regions:**")
                 for i, r in enumerate(tamp["regions"]):
@@ -1358,7 +1384,6 @@ def main():
             st.markdown(f"**SHA-256:** `{result['file_hash']}`")
             st.markdown(f"**Analyzed:** {result['analyzed_at'][:19]} UTC")
 
-        # ── New Analysis ──
         st.markdown("---")
         if st.button("🔄 Analyze Another Image", use_container_width=True):
             st.session_state.result = None
