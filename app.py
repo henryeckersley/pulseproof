@@ -828,7 +828,7 @@ def main():
         bscan = result["binary_ai_scan"]
 
         # ── Top Row: Score + Scorecard ──
-        score_col_ui, card_col = st.columns([1, 2.5])
+        score_col_ui, card_col_ui = st.columns([1, 2.5])
 
         with score_col_ui:
             col_val = score_col(sc["overall_score"], 100)
